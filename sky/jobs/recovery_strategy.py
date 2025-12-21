@@ -123,6 +123,9 @@ class StrategyExecutor:
     ) -> 'StrategyExecutor':
         """Create a strategy from a task."""
 
+        # TODO(cooperc): Consider defaulting to FAILOVER if using k8s with a
+        # single context, since there are not multiple clouds/regions to
+        # failover through.
         resource_list = list(task.resources)
         job_recovery = resource_list[0].job_recovery
         for resource in resource_list:
@@ -275,19 +278,25 @@ class StrategyExecutor:
                 break
 
             try:
-                status = await managed_job_utils.get_job_status(
-                    self.backend,
-                    self.cluster_name,
-                    job_id=self.job_id_on_pool_cluster)
+                status, transient_error_reason = (
+                    await managed_job_utils.get_job_status(
+                        self.backend,
+                        self.cluster_name,
+                        job_id=self.job_id_on_pool_cluster))
             except Exception as e:  # pylint: disable=broad-except
+                transient_error_reason = common_utils.format_exception(e)
                 # If any unexpected error happens, retry the job checking
                 # loop.
                 # Note: the CommandError is already handled in the
                 # get_job_status, so it should not happen here.
                 # TODO(zhwu): log the unexpected error to usage collection
                 # for future debugging.
-                logger.info(f'Unexpected exception: {e}\nFailed to get the '
-                            'job status. Retrying.')
+                logger.info('Unexpected exception during fetching job status: '
+                            f'{common_utils.format_exception(e)}')
+                continue
+            if transient_error_reason is not None:
+                logger.info('Transient error when fetching the job status: '
+                            f'{transient_error_reason}')
                 continue
 
             # Check the job status until it is not in initialized status
@@ -444,9 +453,16 @@ class StrategyExecutor:
                                 raise
                             logger.info('Managed job cluster launched.')
                         else:
+                            # Get task resources from DAG for resource-aware
+                            # scheduling.
+                            task_resources = None
+                            if self.dag.tasks:
+                                task = self.dag.tasks[self.task_id]
+                                task_resources = task.resources
+
                             self.cluster_name = await (context_utils.to_thread(
                                 serve_utils.get_next_cluster_name, self.pool,
-                                self.job_id))
+                                self.job_id, task_resources))
                             if self.cluster_name is None:
                                 raise exceptions.NoClusterLaunchedError(
                                     'No cluster name found in the pool.')
