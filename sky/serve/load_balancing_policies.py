@@ -42,7 +42,7 @@ class LoadBalancingPolicy:
 
     def __init__(self) -> None:
         self.ready_replicas: List[str] = []
-
+        self.ready_replicas_regions: Dict[str, str] = {}
     def __init_subclass__(cls, name: str, default: bool = False):
         LB_POLICIES[name] = cls
         if default:
@@ -86,7 +86,8 @@ class LoadBalancingPolicy:
     # TODO(tian): We should have an abstract class for Request to
     # compatible with all frameworks.
     async def _select_replica(self,
-                              request: 'fastapi.Request') -> Optional[str]:
+                              request: 'fastapi.Request',
+                              factor_network_cost: bool = False) -> Optional[str]:
         raise NotImplementedError
 
     async def pre_execute_hook(self, replica_url: str,
@@ -121,6 +122,29 @@ class LoadBalancingPolicy:
         # Restore original replicas
         self.ready_replicas = original_replicas
 
+        return replica
+
+    async def select_replica_from_subset_network_aware(self, request: 'fastapi.Request',
+                                         available_replicas: List[str],
+                                         available_replicas_regions: Dict[str, str],
+                                         **kwargs) -> Optional[str]:
+        if not available_replicas:
+            return None
+
+        # Save original replicas
+        original_replicas = self.ready_replicas.copy()
+        original_replicas_regions = self.ready_replicas_regions.copy()
+        
+        # Temporarily set ready_replicas to only available ones
+        self.ready_replicas = available_replicas
+        self.ready_replicas_regions = available_replicas_regions    
+
+        # Select using the existing policy logic
+        replica = await self._select_replica(request, **kwargs)
+
+        # Restore original replicas
+        self.ready_replicas = original_replicas
+        self.ready_replicas_regions = original_replicas_regions
         return replica
 
 
@@ -376,6 +400,17 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         self.load_balancing_enabled: bool = False
         self.least_load_fallback: bool = True
 
+    async def select_replica(self, request: 'fastapi.Request',
+                             factor_network_cost: bool = False) -> Optional[str]:
+        replica = await self._select_replica(request, factor_network_cost=factor_network_cost)
+        if replica is not None:
+            logger.info(f'Selected replica {replica} '
+                        f'for request {_request_repr(request)}')
+        else:
+            logger.warning('No replica selected for request '
+                           f'{_request_repr(request)}')
+        return replica
+
     def disbale_least_load_fallback(self) -> None:
         self.least_load_fallback = False
 
@@ -398,6 +433,7 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         await super().set_ready_replicas(ready_replicas)
 
     async def _select_replica(self, request: 'fastapi.Request',
+                              factor_network_cost: bool = False,
                               **kwargs) -> Optional[str]:
         if not self.ready_replicas:
             return None
@@ -408,7 +444,13 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         if text is None:
             logger.debug(f'No text found in request {_request_repr(request)}. '
                          'Falling back to least load.')
-            return min(replica2load, key=lambda r: replica2load[r])
+            selected_replica = min(replica2load, key=lambda r: replica2load[r])
+            # Network cost consideration can be added here if factor_network_cost is True
+            if factor_network_cost:
+                # TODO(alessio): start with searching for lowest network latency cost 
+                # among min load replicas if min > 0
+                pass
+            return selected_replica
             # return await super()._select_replica(request, **kwargs)
         is_imbalanced = False
         min_replica = None
@@ -430,6 +472,7 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         #     if not replica2load:
         #         return None
         #     return min(replica2load, key=replica2load.get)
+        # TODO(alessio): need to return ALL matched rates and not just matched_node
         matched_text, replica = await self.tree.prefix_match(text, replica2load)
         matched_rate = len(matched_text) / len(text)
         logger.debug(f'Matched rate: {matched_rate} for request {text[:100]}.')
@@ -440,7 +483,13 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
             return_matched_rate = kwargs.get('return_matched_rate', False)
             if return_matched_rate:
                 return replica, matched_rate, len(matched_text)  # type: ignore
-            return replica
+
+            # TODO(alessio): do same thing as earlier(:464) with network cost consideration
+            selected_replica = replica
+            if factor_network_cost:
+                pass
+
+            return selected_replica
         # logger.info('Falling back to least char count load. '
         #             f'{self.tree.replica_char_count}')
         logger.debug('Falling back to least replica load. '
@@ -448,7 +497,13 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         replica2load.pop(disabled_url, None)
         if not replica2load:
             return None
-        return min(replica2load, key=lambda r: replica2load[r])
+
+        selected_replica = min(replica2load, key=lambda r: replica2load[r])
+        # TODO(alessio): do same thing as earlier(:449) with network cost consideration
+        if factor_network_cost:
+            pass
+
+        return selected_replica
         # return await self.tree.get_smallest_replica(self.ready_replicas,
         #                                             disabled_url)
 
@@ -462,3 +517,4 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
                            f'{await request.body()}')
             return
         await self.tree.insert(text, replica_url)
+

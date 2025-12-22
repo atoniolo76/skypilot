@@ -309,6 +309,13 @@ class PrefixTree:
         #         await reverse_node.replica_access(replica)
         #         reverse_node = await reverse_node.get_parent()
 
+
+        # questions: TODO
+        # 1. for skywalker lb policy, is there a prefix tree per region? 
+        # does it perform prefix_match among all regions and then finds the one with the highest match rate? nl
+        # it returns the matched text, which may be used to accomplish this. 
+        # i think it  will only search other regions if there are no available replicas in the current region?
+
         return text[:current_idx], replica
 
     async def _leaf_of(self, node: PrefixTreeNode) -> Iterable[str]:

@@ -208,6 +208,8 @@ class ClientPool:
         # Track current active requests per replica
         self._active_requests: Dict[str, int] = dict()
         self._available_replicas: List[str] = []
+        # TODO(alessio): add a region mapping for replicas
+        self._available_replicas_regions: Dict[str, str] = dict()
         # Maximum concurrent requests per replica
         self._max_concurrent_requests = max_concurrent_requests
         # We need this lock to avoid getting from the client pool while
@@ -238,7 +240,7 @@ class ClientPool:
                 self._pool[url].latency = latency
 
     async def refresh_with_new_urls(
-            self, ready_urls: List[str]) -> List[asyncio.Task]:
+            self, ready_urls: List[str], url_to_region: Optional[Dict[str, str]] = None) -> List[asyncio.Task]:
         tasks = []
         async with self._lock:
             await self._load_balancing_policy.set_ready_replicas(ready_urls)
@@ -254,6 +256,8 @@ class ClientPool:
                     self._active_requests[replica_url] = 0
                     if replica_url not in self._available_replicas:
                         self._available_replicas.append(replica_url)
+                        if url_to_region:
+                            self._available_replicas_regions[replica_url] = url_to_region.get(replica_url, 'unknown')
             urls_to_close = set(self._pool.keys()) - set(ready_urls)
             for replica_url in urls_to_close:
                 client = self._pool.pop(replica_url)
@@ -274,6 +278,16 @@ class ClientPool:
                 return None
             return await self._load_balancing_policy.select_replica_from_subset(
                 request, self._available_replicas, **kwargs)
+
+    async def select_replica_network_aware(self, request: fastapi.Request,
+                                           **kwargs) -> Optional[str]:
+        async with self._lock:
+            # TODO(alessio): implement network-aware routing
+            # add a region argument for select replica from subset that is mapped to replicas
+            if not self._available_replicas:
+                return None
+            return await self._load_balancing_policy.select_replica_from_subset_network_aware(
+                request, self._available_replicas, self._available_replicas_regions, **kwargs)
 
     async def empty(self) -> bool:
         async with self._lock:
@@ -476,21 +490,35 @@ class SkyServeLoadBalancer:
                 except aiohttp.ClientError as e:
                     logger.error('An error occurred when syncing with '
                                  f'the controller: {e}')
+                # try/except/else. else code runs if no exception. put code 
+                # that you want to run but don't want to break if exceptions in an else blocks
                 else:
                     # TODO(tian): Check if there is any replica that is not
                     # assigned a LB.
                     logger.info(f'All ready replica URLs: {ready_replica_urls}')
                     logger.info(f'All ready LB URLs: {ready_lb_urls}')
+                    # Create URL to region mapping before flattening
+                    url_to_region = {}
+                    for region, urls in ready_replica_urls.items():
+                        for url in urls:
+                            url_to_region[url] = region
+
+                    # for intra region replicas
                     if self._region is not None and self._region != 'global':
                         ready_urls = ready_replica_urls.get(self._region, [])
                     else:
-                        ready_urls = sum(ready_replica_urls.values(), [])
+                        # for lbs (cross-region)
+                        # TODO
+                        # when you don't set a region parameter for the load balancer,
+                        # it will look in every region for replicas and not do selective pushing
+                        # Flatten the list of lists of ready replica URLs into a single list.
+                        ready_urls = [url for urls in ready_replica_urls.values() for url in urls]
                     logger.info(f'Available Replica URLs: {ready_replica_urls},'
                                 f' Ready URLs in local region {self._region}: '
                                 f'{ready_urls}')
                     close_client_tasks.extend(
                         await
-                        self._replica_pool.refresh_with_new_urls(ready_urls))
+                        self._replica_pool.refresh_with_new_urls(ready_urls, url_to_region))
                     for rurl in ready_urls:
                         if rurl not in self._replica2id:
                             self._replica2id[rurl] = str(len(self._replica2id))
@@ -800,8 +828,11 @@ class SkyServeLoadBalancer:
 
                     # If enabled and when local replica all unavailable,
                     # try push it to other LBs.
+                    # TODO(alessio): this seems like good place to do network-aware routing
                     try:
-                        ready_lb_url = await self._lb_pool.select_replica(
+                        #ready_lb_url = await self._lb_pool.select_replica(
+                           # entry.request)
+                        ready_lb_url = await self._lb_pool.select_replica_network_aware(
                             entry.request)
                     except starlette_requests.ClientDisconnect as e:
                         # Client disconnected. Skip this request.
