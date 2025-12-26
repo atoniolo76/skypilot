@@ -116,3 +116,34 @@ TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
 
 # The health check endpoint for load balancer.
 LB_HEALTH_ENDPOINT = '/sky-lb-health'
+
+# TODO(alessio): network cost thresholds
+NEWTORK_COST_THRESHOLDS = {
+    "us": {
+        "us": 0.3,
+        "eu": 101.7,
+        "asia": 124.1,
+        "sa": 137.1
+    },
+    "eu": {
+        "us": 101.6,
+        "eu": 0.2,
+        "asia": 221.6,
+        "sa": 200.1
+    },
+    "asia": {
+        "us": 124.2,
+        "eu": 221.5,
+        "asia": 0.3,
+        "sa": 256.3
+    },
+    "sa": {
+        "us": 137.1,
+        "eu": 200.1,
+        "asia": 256.5,
+        "sa": 0.3
+    }
+}
+
+AVG_REQUEST_CHARS = 100  # Assume average 100 chars per request
+PER_CHAR_PROCESS_TIME_MS = 0.1  # Assume each char takes 0.1 ms to process on GPU

@@ -13,6 +13,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import prefix_tree
 from sky.serve import serve_utils
+from sky.serve import constants
 
 if typing.TYPE_CHECKING:
     import fastapi
@@ -86,7 +87,7 @@ class LoadBalancingPolicy:
     # TODO(tian): We should have an abstract class for Request to
     # compatible with all frameworks.
     async def _select_replica(self,
-                              request: 'fastapi.Request',
+                              request: 'fastapi.Request',  
                               factor_network_cost: bool = False) -> Optional[str]:
         raise NotImplementedError
 
@@ -127,6 +128,7 @@ class LoadBalancingPolicy:
     async def select_replica_from_subset_network_aware(self, request: 'fastapi.Request',
                                          available_replicas: List[str],
                                          available_replicas_regions: Dict[str, str],
+                                         region: str,
                                          **kwargs) -> Optional[str]:
         if not available_replicas:
             return None
@@ -140,7 +142,7 @@ class LoadBalancingPolicy:
         self.ready_replicas_regions = available_replicas_regions    
 
         # Select using the existing policy logic
-        replica = await self._select_replica(request, **kwargs)
+        replica = await self._select_replica(request, region, **kwargs)
 
         # Restore original replicas
         self.ready_replicas = original_replicas
@@ -398,11 +400,12 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         self.tree = prefix_tree.PrefixTree()
         self.config = PrefixTreeConfig()
         self.load_balancing_enabled: bool = False
-        self.least_load_fallback: bool = True
+        self.least_load_fallback: bool = True 
 
     async def select_replica(self, request: 'fastapi.Request',
+                             region: str,
                              factor_network_cost: bool = False) -> Optional[str]:
-        replica = await self._select_replica(request, factor_network_cost=factor_network_cost)
+        replica = await self._select_replica(request, region, factor_network_cost=factor_network_cost)
         if replica is not None:
             logger.info(f'Selected replica {replica} '
                         f'for request {_request_repr(request)}')
@@ -432,7 +435,14 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
                 await self.tree.remove_replica(replica)
         await super().set_ready_replicas(ready_replicas)
 
+    async def set_ready_replicas_with_region(self, ready_replicas: List[str], url_to_region: Dict[str, str]) -> None:
+        if set(self.ready_replicas) == set(ready_replicas) and self.ready_replicas_regions == url_to_region:
+            return
+        await super().set_ready_replicas(ready_replicas)
+        self.ready_replicas_regions.update(url_to_region)
+
     async def _select_replica(self, request: 'fastapi.Request',
+                              region: str,
                               factor_network_cost: bool = False,
                               **kwargs) -> Optional[str]:
         if not self.ready_replicas:
@@ -447,11 +457,29 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
             selected_replica = min(replica2load, key=lambda r: replica2load[r])
             # Network cost consideration can be added here if factor_network_cost is True
             if factor_network_cost:
-                # TODO(alessio): start with searching for lowest network latency cost 
+                # done(alessio): start with searching for lowest network latency cost 
                 # among min load replicas if min > 0
-                pass
+                selected_replica = None
+                min_load = float('inf')
+                min_load_replicas = []
+                for replica in replica2load.keys():
+                    if replica2load[replica] > 0 and replica2load[replica] < min_load:
+                        min_load = replica2load[replica]
+                        min_load_replicas = [replica]
+                    elif replica2load[replica] > 0 and replica2load[replica] == min_load:
+                        min_load_replicas.append(replica)
+                if min_load_replicas:
+                    min_network_cost = float('inf')
+                    min_network_cost_replica = None
+                    for replica in min_load_replicas:
+                        current_region = self.ready_replicas_regions[replica]
+                        network_cost = constants.NEWTORK_COST_THRESHOLDS[region][current_region]
+                        if network_cost < min_network_cost:
+                            min_network_cost_replica = replica
+                            min_network_cost = network_cost
+                    if min_network_cost_replica is not None:
+                        selected_replica = min_network_cost_replica
             return selected_replica
-            # return await super()._select_replica(request, **kwargs)
         is_imbalanced = False
         min_replica = None
         if self.load_balancing_enabled:
@@ -472,24 +500,76 @@ class PrefixTreePolicy(LeastLoadPolicy, name='prefix_tree', default=False):
         #     if not replica2load:
         #         return None
         #     return min(replica2load, key=replica2load.get)
-        # TODO(alessio): need to return ALL matched rates and not just matched_node
-        matched_text, replica = await self.tree.prefix_match(text, replica2load)
-        matched_rate = len(matched_text) / len(text)
-        logger.debug(f'Matched rate: {matched_rate} for request {text[:100]}.')
-        if cache_threshold is None:
-            cache_threshold = self.config.cache_threshold
-        if not self.least_load_fallback or matched_rate > cache_threshold:
-            # TODO(tian): Hack. Fix this.
-            return_matched_rate = kwargs.get('return_matched_rate', False)
-            if return_matched_rate:
-                return replica, matched_rate, len(matched_text)  # type: ignore
+        # Get all matched rates and their available replicas
+        all_matches = await self.tree.prefix_match_all_rates(text, replica2load)
 
-            # TODO(alessio): do same thing as earlier(:464) with network cost consideration
-            selected_replica = replica
-            if factor_network_cost:
-                pass
+        if all_matches:
+            # Try to find the best match above threshold
+            best_replica = None
+            best_match_rate = 0.0
 
-            return selected_replica
+            for match_rate, available_replicas in all_matches:
+                logger.debug(f'Available match rate: {match_rate} for request {text[:100]} '
+                           f'with replicas: {available_replicas}')
+
+                if cache_threshold is None:
+                    cache_threshold = self.config.cache_threshold
+
+                if match_rate > cache_threshold:
+                    # Find replica with lowest load among available ones
+                    min_load = float('inf')
+                    for replica in available_replicas:
+                        load = replica2load.get(replica, 0)
+                        if load < min_load:
+                            min_load = load
+                            best_replica = replica
+
+                    best_match_rate = match_rate
+                    break  # Take the first (highest) match rate above threshold
+
+            if best_replica is not None:
+                # TODO(alessio): do same thing as earlier(:464) with network cost consideration
+                selected_replica = best_replica
+                if factor_network_cost:
+                    # Compute total cost = network cost + load pending - num_matched_chars effect (all in ms)
+                    # Constants for the estimation
+                    constants.AVG_REQUEST_CHARS = 100  # Assume average 100 chars per request
+                    constants.PER_CHAR_PROCESS_TIME_MS = 0.1  # Assume each char takes 0.1 ms to process on GPU
+
+                    min_total_cost = float('inf')
+                    min_total_cost_replica = None
+                    matched_text_len = int(best_match_rate * len(text))
+                    for replica in available_replicas:
+                        current_region = self.ready_replicas_regions[replica]
+                        network_cost = constants.NEWTORK_COST_THRESHOLDS[region][current_region]  # in ms
+
+                        # Load pending in ms: load * (average chars per request) * (process time per char)
+                        # This is a rough estimate of the pending time at this replica.
+                        load_pending = replica2load.get(replica, 0) * constants.AVG_REQUEST_CHARS * constants.PER_CHAR_PROCESS_TIME_MS
+
+                        # Prefix match score: number of chars matched * process time per char
+                        prefix_gain = matched_text_len * constants.PER_CHAR_PROCESS_TIME_MS
+
+                        # Compute total cost
+                        total_cost = network_cost + load_pending - prefix_gain
+
+                        logger.debug(f"[SkywalkerPolicy] Replica {replica}: "
+                                     f"network_cost={network_cost}, load_pending={load_pending}, "
+                                     f"prefix_gain={prefix_gain}, total_cost={total_cost}")
+
+                        if total_cost < min_total_cost:
+                            min_total_cost = total_cost
+                            min_total_cost_replica = replica
+
+                    if min_total_cost_replica is not None:
+                        selected_replica = min_total_cost_replica
+
+                return_matched_rate = kwargs.get('return_matched_rate', False)
+                if return_matched_rate:
+                    matched_text_len = int(best_match_rate * len(text))
+                    return selected_replica, best_match_rate, matched_text_len  # type: ignore
+
+                return selected_replica
         # logger.info('Falling back to least char count load. '
         #             f'{self.tree.replica_char_count}')
         logger.debug('Falling back to least replica load. '

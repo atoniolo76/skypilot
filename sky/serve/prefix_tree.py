@@ -247,6 +247,23 @@ class PrefixTree:
             matched_text: The longest prefix of text that matches.
             replica: The replica that has accessed the matched node.
         """
+
+    async def prefix_match_all_rates(
+        self,
+        text: str,
+        available2load: Optional[Dict[str, int]] = None
+    ) -> List[Tuple[float, List[str]]]:
+        """Find all prefix match rates and their available replicas.
+
+        Args:
+            text: The text to match.
+            available2load: Dict of replicas to the current load of the replica.
+              If None, all replicas are considered.
+
+        Returns:
+            List of (match_rate, available_replicas) tuples for all prefix positions
+            where replicas are available, ordered by match rate (highest first).
+        """
         logger.debug(f'prefix_match: {text[:100]} with '
                      f'available2load: {available2load}')
         current_idx = 0
@@ -317,6 +334,70 @@ class PrefixTree:
         # i think it  will only search other regions if there are no available replicas in the current region?
 
         return text[:current_idx], replica
+
+    async def prefix_match_all_rates(
+        self,
+        text: str,
+        available2load: Optional[Dict[str, int]] = None
+    ) -> List[Tuple[float, List[str]]]:
+        """Find all prefix match rates and their available replicas.
+
+        Args:
+            text: The text to match.
+            available2load: Dict of replicas to the current load of the replica.
+              If None, all replicas are considered.
+
+        Returns:
+            List of (match_rate, available_replicas) tuples for all prefix positions
+            where replicas are available, ordered by match rate (highest first).
+        """
+        logger.debug(f'prefix_match_all_rates: {text[:100]} with '
+                     f'available2load: {available2load}')
+
+        text_len = len(text)
+        if text_len == 0:
+            return []
+
+        available_replica_set = (set(available2load.keys())
+                                 if available2load is not None else None)
+
+        all_matches = []
+        current_idx = 0
+        succ_node = self.root
+
+        while current_idx < text_len:
+            first_char = text[current_idx]
+            remaining_text = text[current_idx:]
+            current_node = succ_node
+            matched_node = await current_node.get_child(first_char)
+
+            if matched_node is None:
+                break
+
+            # Check if this node has available replicas
+            node_replicas = await matched_node.get_all_replicas()
+            if available_replica_set is not None:
+                available_replicas = list(node_replicas & available_replica_set)
+            else:
+                available_replicas = list(node_replicas)
+
+            if available_replicas:
+                # Calculate match rate for current prefix
+                match_rate = (current_idx + 1) / text_len
+                all_matches.append((match_rate, available_replicas))
+
+            succ_node = matched_node
+            shared_count = _shared_prefix_length(await matched_node.get_text(),
+                                                 remaining_text)
+            current_idx += shared_count
+
+            if shared_count < len(await matched_node.get_text()):
+                # Partial match, stop here
+                break
+
+        # Sort by match rate (highest first)
+        all_matches.sort(key=lambda x: x[0], reverse=True)
+        return all_matches
 
     async def _leaf_of(self, node: PrefixTreeNode) -> Iterable[str]:
         candidates = set((await

@@ -243,7 +243,7 @@ class ClientPool:
             self, ready_urls: List[str], url_to_region: Optional[Dict[str, str]] = None) -> List[asyncio.Task]:
         tasks = []
         async with self._lock:
-            await self._load_balancing_policy.set_ready_replicas(ready_urls)
+            await self._load_balancing_policy.set_ready_replicas_with_region(ready_urls, url_to_region)
             for replica_url in ready_urls:
                 if replica_url not in self._pool:
                     self._pool[replica_url] = PoolEntry(
@@ -279,15 +279,15 @@ class ClientPool:
             return await self._load_balancing_policy.select_replica_from_subset(
                 request, self._available_replicas, **kwargs)
 
-    async def select_replica_network_aware(self, request: fastapi.Request,
+    async def select_replica_network_aware(self, request: fastapi.Request, region: str,
                                            **kwargs) -> Optional[str]:
         async with self._lock:
-            # TODO(alessio): implement network-aware routing
+            # done(alessio): implement network-aware routing
             # add a region argument for select replica from subset that is mapped to replicas
             if not self._available_replicas:
                 return None
             return await self._load_balancing_policy.select_replica_from_subset_network_aware(
-                request, self._available_replicas, self._available_replicas_regions, **kwargs)
+                request, self._available_replicas, self._available_replicas_regions, region, **kwargs)
 
     async def empty(self) -> bool:
         async with self._lock:
@@ -833,7 +833,7 @@ class SkyServeLoadBalancer:
                         #ready_lb_url = await self._lb_pool.select_replica(
                            # entry.request)
                         ready_lb_url = await self._lb_pool.select_replica_network_aware(
-                            entry.request)
+                            entry.request, self._region)
                     except starlette_requests.ClientDisconnect as e:
                         # Client disconnected. Skip this request.
                         entry.set_failed_on(e)
