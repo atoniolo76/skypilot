@@ -92,12 +92,8 @@ class SkyServiceSpec:
                         raise ValueError('`ports` must not be set for '
                                          'external_load_balancers.')
                 if route53_hosted_zone is not None:
-                    if r.get('cloud', None) != 'aws':
-                        with ux_utils.print_exception_no_traceback():
-                            raise ValueError(
-                                '`cloud` in `external_load_balancers` must be '
-                                'set to `aws` if using route53_hosted_zone.')
-                    r['cloud'] = 'aws'
+                    # Route53 can point to any IP, not just AWS
+                    # We removed the AWS-only restriction to allow Lambda + Route53
                     if r.get('region') is None:
                         with ux_utils.print_exception_no_traceback():
                             raise ValueError(

@@ -227,17 +227,47 @@ def get_domain_name(subdomain: str, hosted_zone: str) -> str:
     return f'{subdomain}.{hosted_zone}'
 
 
+# Map non-AWS regions to nearest AWS region for Route53 latency-based routing
+REGION_TO_AWS_REGION = {
+    # Lambda Cloud regions -> nearest AWS region
+    'australia-east-1': 'ap-southeast-2',  # Sydney
+    'us-west-3': 'us-west-2',  # Oregon (closest to Utah)
+    'us-east-1': 'us-east-1',  # Virginia (same)
+    'us-south-1': 'us-east-2',  # Ohio (closest to Texas)
+    'us-south-2': 'us-east-2',  # Ohio
+    'us-south-3': 'us-east-2',  # Ohio
+    'us-west-1': 'us-west-1',  # N. California
+    'us-west-2': 'us-west-2',  # Oregon
+    'us-east-2': 'us-east-2',  # Ohio
+    'us-east-3': 'us-east-1',  # Virginia
+    'us-midwest-1': 'us-east-2',  # Ohio (closest to midwest)
+    'europe-central-1': 'eu-central-1',  # Frankfurt
+    'europe-south-1': 'eu-south-1',  # Milan
+    'asia-south-1': 'ap-south-1',  # Mumbai
+    'asia-northeast-1': 'ap-northeast-1',  # Tokyo
+    'asia-northeast-2': 'ap-northeast-2',  # Seoul
+    'me-west-1': 'me-south-1',  # Bahrain
+}
+
+
+def _get_aws_region_for_route53(region: str) -> str:
+    """Map any cloud region to an AWS region for Route53 latency routing."""
+    return REGION_TO_AWS_REGION.get(region, region)
+
+
 def get_route53_change(action: str, subdomain: str, hosted_zone: str,
                        record_type: str, region: str,
                        value: str) -> Dict[str, Any]:
+    # Map non-AWS regions to AWS regions for latency-based routing
+    aws_region = _get_aws_region_for_route53(region)
     return {
         'Action': action,
         'ResourceRecordSet': {
             'Name': get_domain_name(subdomain, hosted_zone),
             'Type': record_type,
             'TTL': 300,
-            'Region': region,
-            'SetIdentifier': f'{subdomain}-{region}',
+            'Region': aws_region,
+            'SetIdentifier': f'{subdomain}-{region}',  # Keep original for uniqueness
             'ResourceRecords': [{
                 'Value': value
             }]
