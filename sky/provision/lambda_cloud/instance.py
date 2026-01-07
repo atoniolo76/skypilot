@@ -248,12 +248,46 @@ def query_instances(
     return statuses
 
 
+def _parse_ports(ports: List[str]) -> List[int]:
+    """Parse port strings to list of port numbers.
+    
+    Handles both single ports ('8080') and port ranges ('8080-8090').
+    """
+    port_numbers = []
+    for port_str in ports:
+        if '-' in port_str:
+            start, end = port_str.split('-')
+            port_numbers.extend(range(int(start), int(end) + 1))
+        else:
+            port_numbers.append(int(port_str))
+    return port_numbers
+
+
 def open_ports(
     cluster_name_on_cloud: str,
     ports: List[str],
     provider_config: Optional[Dict[str, Any]] = None,
 ) -> None:
-    raise NotImplementedError('open_ports is not supported for Lambda Cloud')
+    """Open ports on Lambda Cloud instances via firewall rules.
+    
+    Note: Lambda Cloud firewall rules are account-wide, not per-instance.
+    Rules do not apply to the us-south-1 region.
+    """
+    del provider_config  # Unused
+    lambda_client = _get_lambda_client()
+    port_numbers = _parse_ports(ports)
+    
+    if port_numbers:
+        logger.info(f'Opening ports {port_numbers} for cluster '
+                    f'{cluster_name_on_cloud} via Lambda firewall rules')
+        try:
+            lambda_client.add_firewall_rules_for_ports(
+                port_numbers,
+                description_prefix=f'SkyPilot-{cluster_name_on_cloud}'
+            )
+        except Exception as e:
+            logger.warning(f'Failed to open ports via Lambda firewall: {e}')
+            raise
 
 
 def cleanup_ports(
@@ -261,5 +295,22 @@ def cleanup_ports(
     ports: List[str],
     provider_config: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """See sky/provision/__init__.py"""
-    del cluster_name_on_cloud, ports, provider_config  # Unused.
+    """Clean up firewall rules for the specified ports.
+    
+    Only removes rules created by SkyPilot for this specific cluster.
+    """
+    del provider_config  # Unused
+    lambda_client = _get_lambda_client()
+    port_numbers = _parse_ports(ports)
+    
+    if port_numbers:
+        logger.info(f'Cleaning up ports {port_numbers} for cluster '
+                    f'{cluster_name_on_cloud}')
+        try:
+            lambda_client.remove_firewall_rules_for_ports(
+                port_numbers,
+                description_prefix=f'SkyPilot-{cluster_name_on_cloud}'
+            )
+        except Exception as e:
+            # Don't fail on cleanup errors, just log them
+            logger.warning(f'Failed to cleanup firewall rules: {e}')

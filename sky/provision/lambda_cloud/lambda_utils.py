@@ -102,11 +102,18 @@ def _try_request_with_backoff(method: str,
                               data: Optional[str] = None):
     backoff = common_utils.Backoff(initial_backoff=INITIAL_BACKOFF_SECONDS,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
+    # Add Content-Type header for requests with data
+    request_headers = dict(headers)
+    if data is not None:
+        request_headers['Content-Type'] = 'application/json'
+    
     for i in range(MAX_ATTEMPTS):
         if method == 'get':
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=request_headers)
         elif method == 'post':
-            response = requests.post(url, headers=headers, data=data)
+            response = requests.post(url, headers=request_headers, data=data)
+        elif method == 'put':
+            response = requests.put(url, headers=request_headers, data=data)
         else:
             raise ValueError(f'Unsupported requests method: {method}')
         # If rate limited, wait and try again
@@ -245,3 +252,101 @@ class LambdaCloudClient:
                                              f'{API_ENDPOINT}/instance-types',
                                              headers=self.headers)
         return response.json().get('data', [])
+
+    def list_firewall_rules(self) -> List[Dict[str, Any]]:
+        """List current firewall rules."""
+        response = _try_request_with_backoff('get',
+                                             f'{API_ENDPOINT}/firewall-rules',
+                                             headers=self.headers)
+        return response.json().get('data', [])
+
+    def set_firewall_rules(self, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Replace all firewall rules with the given rules.
+        
+        Args:
+            rules: List of firewall rule dicts with keys:
+                - protocol: 'tcp', 'udp', 'icmp', or 'all'
+                - port_range: [min_port, max_port] (not for icmp)
+                - source_network: CIDR notation (e.g., '0.0.0.0/0')
+                - description: Human-readable description
+        
+        Returns:
+            The list of active firewall rules after the update.
+            
+        Note:
+            Firewall rules do not apply to the us-south-1 region.
+        """
+        data = json.dumps({'data': rules})
+        response = _try_request_with_backoff(
+            'put',
+            f'{API_ENDPOINT}/firewall-rules',
+            data=data,
+            headers=self.headers,
+        )
+        return response.json().get('data', [])
+
+    def add_firewall_rules_for_ports(self, ports: List[int],
+                                     description_prefix: str = 'SkyPilot') -> None:
+        """Add firewall rules to open the specified TCP ports.
+        
+        This merges the new ports with existing rules, avoiding duplicates.
+        
+        Args:
+            ports: List of port numbers to open
+            description_prefix: Prefix for the rule description
+        """
+        existing_rules = self.list_firewall_rules()
+        
+        # Track existing port rules to avoid duplicates
+        existing_tcp_ports = set()
+        for rule in existing_rules:
+            if rule.get('protocol') == 'tcp' and 'port_range' in rule:
+                port_range = rule['port_range']
+                if len(port_range) == 2 and port_range[0] == port_range[1]:
+                    existing_tcp_ports.add(port_range[0])
+        
+        # Add new rules for ports not already open
+        new_rules = list(existing_rules)
+        for port in ports:
+            if port not in existing_tcp_ports:
+                new_rules.append({
+                    'protocol': 'tcp',
+                    'port_range': [port, port],
+                    'source_network': '0.0.0.0/0',
+                    'description': f'{description_prefix} port {port}',
+                })
+        
+        if len(new_rules) > len(existing_rules):
+            self.set_firewall_rules(new_rules)
+
+    def remove_firewall_rules_for_ports(self, ports: List[int],
+                                        description_prefix: str = 'SkyPilot') -> None:
+        """Remove firewall rules for the specified ports.
+        
+        Only removes rules that match both the port AND the description prefix.
+        
+        Args:
+            ports: List of port numbers to close
+            description_prefix: Only remove rules with this description prefix
+        """
+        existing_rules = self.list_firewall_rules()
+        ports_set = set(ports)
+        
+        # Filter out rules that match our ports and description prefix
+        filtered_rules = []
+        for rule in existing_rules:
+            should_remove = False
+            if rule.get('protocol') == 'tcp' and 'port_range' in rule:
+                port_range = rule['port_range']
+                if (len(port_range) == 2 and 
+                    port_range[0] == port_range[1] and
+                    port_range[0] in ports_set):
+                    desc = rule.get('description', '')
+                    if desc.startswith(description_prefix):
+                        should_remove = True
+            
+            if not should_remove:
+                filtered_rules.append(rule)
+        
+        if len(filtered_rules) < len(existing_rules):
+            self.set_firewall_rules(filtered_rules)
